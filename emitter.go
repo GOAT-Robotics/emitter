@@ -10,6 +10,8 @@ package emitter
 import (
 	"path"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Flag used to describe what behavior
@@ -32,6 +34,22 @@ const (
 	// FlagSync indicates to send an event synchronously.
 	FlagSync
 )
+
+// --- Debug/metrics types ---
+// BlockInfo describes a failed/non-blocking send due to a full buffer (or sync cancellation).
+type BlockInfo struct {
+	When       time.Time
+	Topic      string
+	ListenerID int64
+	Cap        int
+	Len        int
+	Event      Event
+	Reason     string // "skip", "close", or "sync-blocked"
+}
+
+// OnBlockedFunc is an optional callback invoked when a send cannot proceed
+// (e.g., channel buffer full in non-blocking mode).
+type OnBlockedFunc func(BlockInfo)
 
 // Middlewares.
 
@@ -74,16 +92,24 @@ type Emitter struct {
 	listeners   map[string][]listener
 	isInit      bool
 	middlewares map[string][]func(*Event)
+	// Optional callback invoked when a non-blocking send cannot enqueue
+	OnBlocked OnBlockedFunc
 }
+
+var nextListenerID int64
 
 func newListener(capacity uint, middlewares ...func(*Event)) listener {
 	return listener{
+		id:          atomic.AddInt64(&nextListenerID, 1),
+		createdAt:   time.Now(),
 		ch:          make(chan Event, capacity),
 		middlewares: middlewares,
 	}
 }
 
 type listener struct {
+	id          int64
+	createdAt   time.Time
 	ch          chan Event
 	middlewares []func(*Event)
 }
@@ -240,7 +266,7 @@ func (e *Emitter) Emit(topic string, args ...interface{}) chan struct{} {
 			}
 
 			if (evn.Flags | FlagSync) == evn.Flags {
-				_, remove, _ := pushEvent(done, lstnr.ch, &evn)
+				_, remove, _ := e.sendWithReport(done, lstnr, &evn)
 				if remove {
 					defer e.Off(event.Topic, lstnr.ch)
 				}
@@ -249,7 +275,7 @@ func (e *Emitter) Emit(topic string, args ...interface{}) chan struct{} {
 				haveToWait = true
 				go func(lstnr listener, event *Event) {
 					e.mu.Lock()
-					_, remove, _ := pushEvent(done, lstnr.ch, event)
+					_, remove, _ := e.sendWithReport(done, lstnr, event)
 					if remove {
 						defer e.Off(event.Topic, lstnr.ch)
 					}
@@ -298,6 +324,41 @@ func pushEvent(
 	} else if !canceled {
 		// if event was sent successfully
 		remove = isOnce
+	}
+	return
+}
+
+// reasonFromFlags returns a human-readable reason for a failed send based on flags.
+func reasonFromFlags(f Flag) string {
+	switch {
+	case (f | FlagSkip) == f:
+		return "skip"
+	case (f | FlagClose) == f:
+		return "close"
+	case (f | FlagSync) == f:
+		return "sync-blocked"
+	default:
+		return "unknown"
+	}
+}
+
+// sendWithReport wraps pushEvent to invoke OnBlocked when a non-blocking send fails due to full buffer.
+func (e *Emitter) sendWithReport(done chan struct{}, lstnr listener, ev *Event) (success, remove bool, err error) {
+	success, remove, err = pushEvent(done, lstnr.ch, ev)
+
+	if !success && err == nil {
+		if e.OnBlocked != nil {
+			bi := BlockInfo{
+				When:       time.Now(),
+				Topic:      ev.Topic,
+				ListenerID: lstnr.id,
+				Cap:        cap(lstnr.ch),
+				Len:        len(lstnr.ch),
+				Event:      *ev,
+				Reason:     reasonFromFlags(ev.Flags),
+			}
+			e.OnBlocked(bi)
+		}
 	}
 	return
 }
@@ -377,4 +438,65 @@ func send(
 	}
 	canceled = true
 	return
+}
+
+// ListenerStats provides occupancy info for a single listener.
+type ListenerStats struct {
+	ListenerID int64
+	Cap        int
+	Len        int
+	CreatedAt  time.Time
+}
+
+// TopicStats aggregates listener stats per topic.
+type TopicStats struct {
+	Topic     string
+	Count     int
+	Listeners []ListenerStats
+}
+
+// Snapshot returns a read-only snapshot of current buffer usage for all listeners grouped by topic.
+func (e *Emitter) Snapshot() []TopicStats {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.init()
+
+	out := make([]TopicStats, 0, len(e.listeners))
+	for topic, lst := range e.listeners {
+		ts := TopicStats{Topic: topic, Count: len(lst), Listeners: make([]ListenerStats, 0, len(lst))}
+		for _, l := range lst {
+			ts.Listeners = append(ts.Listeners, ListenerStats{
+				ListenerID: l.id,
+				Cap:        cap(l.ch),
+				Len:        len(l.ch),
+				CreatedAt:  l.createdAt,
+			})
+		}
+		out = append(out, ts)
+	}
+	return out
+}
+
+// StartMetricsLogger periodically logs channel occupancy using the provided logger.
+// It returns a stop function that should be called to stop the logger.
+func (e *Emitter) StartMetricsLogger(every time.Duration, logf func(string, ...interface{})) func() {
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				stats := e.Snapshot()
+				for _, ts := range stats {
+					for _, ls := range ts.Listeners {
+						logf("[emitter] topic=%q id=%d usage=%d/%d", ts.Topic, ls.ListenerID, ls.Len, ls.Cap)
+					}
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return func() { close(stop) }
 }
