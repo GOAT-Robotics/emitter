@@ -8,6 +8,7 @@ The design goals are:
 package emitter
 
 import (
+	"fmt"
 	"path"
 	"sync"
 	"sync/atomic"
@@ -44,7 +45,8 @@ type BlockInfo struct {
 	Cap        int
 	Len        int
 	Event      Event
-	Reason     string // "skip", "close", or "sync-blocked"
+	// Reason explains why send could not proceed: "buffer_full", "listener_closed", "no_listeners", "emitter_done", "skip", "close", "sync-blocked", or "unknown".
+	Reason string
 }
 
 // OnBlockedFunc is an optional callback invoked when a send cannot proceed
@@ -166,15 +168,19 @@ func (e *Emitter) Off(topic string, channels ...<-chan Event) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.init()
-	match, _ := e.matched(topic)
+	match, err := e.matched(topic)
+	if err != nil {
+		fmt.Printf("[emitter] Off: invalid topic pattern %q: %v\n", topic, err)
+	}
 
 	for _, _topic := range match {
 		if listeners, ok := e.listeners[_topic]; ok {
-
+			removedCount := 0
 			if len(channels) == 0 {
 				for i := len(listeners) - 1; i >= 0; i-- {
 					close(listeners[i].ch)
 					listeners = drop(listeners, i)
+					removedCount++
 				}
 
 			} else {
@@ -184,11 +190,18 @@ func (e *Emitter) Off(topic string, channels ...<-chan Event) {
 						if curr == listeners[i].ch {
 							close(listeners[i].ch)
 							listeners = drop(listeners, i)
+							removedCount++
 						}
 					}
 				}
 			}
 			e.listeners[_topic] = listeners
+
+			if removedCount == 0 {
+				fmt.Printf("[emitter] Off: no listeners removed for topic=%q (channels specified: %t)\n", _topic, len(channels) != 0)
+			} else {
+				fmt.Printf("[emitter] Off: removed %d listener(s) for topic=%q\n", removedCount, _topic)
+			}
 		}
 		if len(e.listeners[_topic]) == 0 {
 			delete(e.listeners, _topic)
@@ -236,7 +249,34 @@ func (e *Emitter) Emit(topic string, args ...interface{}) chan struct{} {
 	e.init()
 	done := make(chan struct{}, 1)
 
-	match, _ := e.matched(topic)
+	match, err := e.matched(topic)
+	if err != nil {
+		fmt.Printf("[emitter] Emit: invalid topic pattern %q: %v\n", topic, err)
+	}
+
+	// If nothing matches, surface a single 'no_listeners' report.
+	if e.OnBlocked != nil {
+		empty := true
+		for _, _topic := range match {
+			if len(e.listeners[_topic]) > 0 {
+				empty = false
+				break
+			}
+		}
+		if empty {
+			fmt.Printf("[emitter] Emit: no listeners for topic=%q\n", topic)
+			// No concrete listeners for this topic / pattern.
+			e.OnBlocked(BlockInfo{
+				When:       time.Now(),
+				Topic:      topic,
+				ListenerID: 0,
+				Cap:        0,
+				Len:        0,
+				Event:      Event{Topic: topic, OriginalTopic: topic},
+				Reason:     "no_listeners",
+			})
+		}
+	}
 
 	var wg sync.WaitGroup
 	var haveToWait bool
@@ -304,31 +344,51 @@ func pushEvent(
 	done chan struct{},
 	lstnr chan Event,
 	event *Event,
-) (success, remove bool, err error) {
-	// unwind the flags
+) (success, remove bool, reason string) {
+	// Unwind flags
 	isOnce := (event.Flags | FlagOnce) == event.Flags
 	isSkip := (event.Flags | FlagSkip) == event.Flags
 	isClose := (event.Flags | FlagClose) == event.Flags
 
-	sent, canceled := send(
-		done,
-		lstnr,
-		*event,
-		!(isSkip || isClose),
-	)
+	wait := !(isSkip || isClose)
+
+	sent, canceled, closed := send(done, lstnr, *event, wait)
 	success = sent
 
-	if !sent && !canceled {
+	switch {
+	case closed:
+		// Listener channel was closed.
+		reason = "listener_closed"
+		// If we encountered a closed channel, ensure removal from registry.
+		remove = true
+
+	case !sent && canceled:
+		// Emit was canceled by 'done' (emitter finished / lifecycle end).
+		reason = "emitter_done"
+		remove = false
+
+	case !sent && !canceled && !wait:
+		// Non-blocking send and buffer was full.
+		reason = "buffer_full"
 		remove = isClose
-		// if not sent
-	} else if !canceled {
-		// if event was sent successfully
+
+	case sent:
+		// Successful send: removal depends on Once flag.
 		remove = isOnce
+
+	default:
+		// Fallback to any reason hinted by flags (e.g., skip/close/sync-blocked).
+		if r := reasonFromFlags(event.Flags); r != "" {
+			reason = r
+		} else {
+			reason = "unknown"
+		}
+		// Removal for non-success already handled above; keep remove=false here.
 	}
 	return
 }
 
-// reasonFromFlags returns a human-readable reason for a failed send based on flags.
+// reasonFromFlags returns a human-readable reason derived from flags when applicable.
 func reasonFromFlags(f Flag) string {
 	switch {
 	case (f | FlagSkip) == f:
@@ -338,27 +398,30 @@ func reasonFromFlags(f Flag) string {
 	case (f | FlagSync) == f:
 		return "sync-blocked"
 	default:
-		return "unknown"
+		return ""
 	}
 }
 
-// sendWithReport wraps pushEvent to invoke OnBlocked when a non-blocking send fails due to full buffer.
+// sendWithReport wraps pushEvent to invoke OnBlocked when a send could not proceed.
 func (e *Emitter) sendWithReport(done chan struct{}, lstnr listener, ev *Event) (success, remove bool, err error) {
-	success, remove, err = pushEvent(done, lstnr.ch, ev)
+	success, remove, reason := pushEvent(done, lstnr.ch, ev)
 
-	if !success && err == nil {
-		if e.OnBlocked != nil {
-			bi := BlockInfo{
-				When:       time.Now(),
-				Topic:      ev.Topic,
-				ListenerID: lstnr.id,
-				Cap:        cap(lstnr.ch),
-				Len:        len(lstnr.ch),
-				Event:      *ev,
-				Reason:     reasonFromFlags(ev.Flags),
-			}
-			e.OnBlocked(bi)
+	if !success && e.OnBlocked != nil {
+		ri := reason
+		if ri == "" {
+			ri = "unknown"
 		}
+		bi := BlockInfo{
+			When:       time.Now(),
+			Topic:      ev.Topic,
+			ListenerID: lstnr.id,
+			Cap:        cap(lstnr.ch),
+			Len:        len(lstnr.ch),
+			Event:      *ev,
+			Reason:     ri,
+		}
+		fmt.Printf("[emitter] blocked: topic=%q id=%d usage=%d/%d reason=%s\n", bi.Topic, bi.ListenerID, bi.Len, bi.Cap, ri)
+		e.OnBlocked(bi)
 	}
 	return
 }
@@ -386,6 +449,7 @@ func (e *Emitter) matched(topic string) ([]string, error) {
 	var err error
 	for k := range e.listeners {
 		if matched, err := path.Match(topic, k); err != nil {
+			fmt.Printf("[emitter] matched: invalid pattern %q vs %q: %v\n", topic, k, err)
 			return []string{}, err
 		} else if matched {
 			acc = append(acc, k)
@@ -406,10 +470,11 @@ func send(
 	done chan struct{},
 	ch chan Event,
 	e Event, wait bool,
-) (sent, canceled bool) {
-
+) (sent, canceled, closed bool) {
 	defer func() {
 		if r := recover(); r != nil {
+			// Sending on a closed channel panics; flag as closed.
+			closed = true
 			canceled = false
 			sent = false
 		}
@@ -418,25 +483,24 @@ func send(
 	if !wait {
 		select {
 		case <-done:
-			break
+			// Emit lifecycle finished before we could send.
+			canceled = true
 		case ch <- e:
 			sent = true
 			return
 		default:
+			// Non-blocking and channel buffer is full.
 			return
 		}
-
 	} else {
 		select {
 		case <-done:
-			break
+			canceled = true
 		case ch <- e:
 			sent = true
 			return
 		}
-
 	}
-	canceled = true
 	return
 }
 
