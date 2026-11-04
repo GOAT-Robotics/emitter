@@ -38,6 +38,41 @@ for event := range e.On("change") {
 
 By default, the emitter uses one goroutine per listener to send an event. You can change that behavior from asynchronous to synchronous by passing `emitter.Sync` flag as shown here: `e.Use("*", emitter.Sync)`. I recommend specifying middlewares(see [below](#middlewares)) for the emitter at the begining.
 
+## Delivery and backpressure
+
+Delivery never holds the emitter registry lock. A stalled listener therefore
+cannot block `On`, `Off`, `Listeners`, `Snapshot`, or asynchronous delivery to other listeners.
+`Off` cancels pending sends, closes the removed channels, and is safe to repeat.
+Buffered events remain readable after the channel is closed.
+
+The default delivery is asynchronous and waits for the listener to accept each
+event. Always call `Off` when its consumer stops so pending deliveries can exit.
+`Once` delivers at most one successful event, including with concurrent emitters.
+
+Choose an explicit overflow policy for long-lived streams:
+
+```go
+// Live samples: skip a full listener's sample; other listeners still receive it.
+telemetry := emitter.New(5000)
+telemetry.Use("*", emitter.Sync, emitter.Skip)
+
+// Action responses: close a full listener so the caller can report overload
+// rather than wait forever for a discarded completion result.
+actions := emitter.New(10000)
+actions.Use("*", emitter.Sync, emitter.Close)
+```
+
+`Sync` runs delivery in the calling goroutine. Pairing it with `Skip` or `Close`
+avoids creating a goroutine per event and preserves sequential emission order.
+Concurrent `Emit` calls have no guaranteed order. Patterns use `path.Match`, so
+`*` matches a single path component, not topics containing `/`; register suitable
+patterns or listener middleware for those topics.
+
+`OnBlocked` runs outside internal locks and may inspect or remove listeners. Set
+it before concurrent use, make it safe for concurrent calls, and return promptly.
+`buffer_full` reports overflow; `no_listeners` means no matching listener was
+registered. The library does not print diagnostics to stdout.
+
 ## Wildcard
 The package allows publications and subscriptions with wildcard. This feature is based on `path.Match` function.
 

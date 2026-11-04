@@ -8,7 +8,6 @@ The design goals are:
 package emitter
 
 import (
-	"fmt"
 	"path"
 	"sync"
 	"sync/atomic"
@@ -94,7 +93,8 @@ type Emitter struct {
 	listeners   map[string][]listener
 	isInit      bool
 	middlewares map[string][]func(*Event)
-	// Optional callback invoked when a non-blocking send cannot enqueue
+	// Callback for overflow or no matching listeners. Called outside internal locks;
+	// set before concurrent use and make it safe for concurrent calls.
 	OnBlocked OnBlockedFunc
 }
 
@@ -105,11 +105,37 @@ func newListener(capacity uint, middlewares ...func(*Event)) listener {
 		id:          atomic.AddInt64(&nextListenerID, 1),
 		createdAt:   time.Now(),
 		ch:          make(chan Event, capacity),
-		middlewares: middlewares,
+		middlewares: append([]func(*Event){}, middlewares...),
+		state:       &listenerState{stopped: make(chan struct{})},
+	}
+}
+
+// Copies of a listener share delivery state. Never hold Emitter.mu while
+// acquiring state.mu: a blocked send must not prevent registry operations.
+type listenerState struct {
+	mu       sync.Mutex
+	stopped  chan struct{}
+	stopOnce sync.Once
+	closed   bool
+}
+
+func (l listener) stop() {
+	l.state.stopOnce.Do(func() { close(l.state.stopped) })
+	l.state.mu.Lock()
+	defer l.state.mu.Unlock()
+	l.closeLocked()
+}
+
+func (l listener) closeLocked() {
+	if !l.state.closed {
+		l.state.stopOnce.Do(func() { close(l.state.stopped) })
+		close(l.ch)
+		l.state.closed = true
 	}
 }
 
 type listener struct {
+	state       *listenerState
 	id          int64
 	createdAt   time.Time
 	ch          chan Event
@@ -130,7 +156,7 @@ func (e *Emitter) Use(pattern string, middlewares ...func(*Event)) {
 	e.init()
 	defer e.mu.Unlock()
 
-	e.middlewares[pattern] = middlewares
+	e.middlewares[pattern] = append([]func(*Event){}, middlewares...)
 	if len(e.middlewares[pattern]) == 0 {
 		delete(e.middlewares, pattern)
 	}
@@ -166,45 +192,56 @@ func (e *Emitter) Once(topic string, middlewares ...func(*Event)) <-chan Event {
 // topic, it can be pattern as well.
 func (e *Emitter) Off(topic string, channels ...<-chan Event) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.init()
-	match, err := e.matched(topic)
-	if err != nil {
-		fmt.Printf("[emitter] Off: invalid topic pattern %q: %v\n", topic, err)
-	}
-
-	for _, _topic := range match {
-		if listeners, ok := e.listeners[_topic]; ok {
-			removedCount := 0
-			if len(channels) == 0 {
-				for i := len(listeners) - 1; i >= 0; i-- {
-					close(listeners[i].ch)
-					listeners = drop(listeners, i)
-					removedCount++
-				}
-
-			} else {
-				for chi := range channels {
-					curr := channels[chi]
-					for i := len(listeners) - 1; i >= 0; i-- {
-						if curr == listeners[i].ch {
-							close(listeners[i].ch)
-							listeners = drop(listeners, i)
-							removedCount++
-						}
-					}
+	match, _ := e.matched(topic)
+	var removed []listener
+	for _, topic := range match {
+		var kept []listener
+		for _, l := range e.listeners[topic] {
+			remove := len(channels) == 0
+			for _, ch := range channels {
+				if ch == l.ch {
+					remove = true
+					break
 				}
 			}
-			e.listeners[_topic] = listeners
-
-			if removedCount == 0 {
-				fmt.Printf("[emitter] Off: no listeners removed for topic=%q (channels specified: %t)\n", _topic, len(channels) != 0)
+			if remove {
+				removed = append(removed, l)
 			} else {
-				fmt.Printf("[emitter] Off: removed %d listener(s) for topic=%q\n", removedCount, _topic)
+				kept = append(kept, l)
 			}
 		}
-		if len(e.listeners[_topic]) == 0 {
-			delete(e.listeners, _topic)
+		if len(kept) == 0 {
+			delete(e.listeners, topic)
+		} else {
+			e.listeners[topic] = kept
+		}
+	}
+	e.mu.Unlock()
+	// Cancel sends before waiting for their per-listener mutex. Other topics and
+	// newly registered listeners remain usable while cleanup completes.
+	for _, l := range removed {
+		l.state.stopOnce.Do(func() { close(l.state.stopped) })
+	}
+	for _, l := range removed {
+		l.stop()
+	}
+}
+
+// removeListener removes one exact registration, never a replacement listener.
+func (e *Emitter) removeListener(topic string, id int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	list := e.listeners[topic]
+	for i, l := range list {
+		if l.id == id {
+			list = drop(list, i)
+			if len(list) == 0 {
+				delete(e.listeners, topic)
+			} else {
+				e.listeners[topic] = list
+			}
+			return
 		}
 	}
 }
@@ -245,99 +282,120 @@ func (e *Emitter) Topics() []string {
 // Emit emits an event with the rest arguments to all
 // listeners which were covered by topic(it can be pattern).
 func (e *Emitter) Emit(topic string, args ...interface{}) chan struct{} {
+	type target struct {
+		topic      string
+		listeners  []listener
+		middleware []func(*Event)
+	}
+	type delivery struct {
+		topic    string
+		listener listener
+		event    Event
+	}
 	e.mu.Lock()
 	e.init()
+	match, _ := e.matched(topic)
+	var targets []target
+	for _, key := range match {
+		targets = append(targets, target{key, append([]listener(nil), e.listeners[key]...), e.getMiddlewares(key)})
+	}
+	report := e.OnBlocked
+	e.mu.Unlock()
+
 	done := make(chan struct{}, 1)
-
-	match, err := e.matched(topic)
-	if err != nil {
-		fmt.Printf("[emitter] Emit: invalid topic pattern %q: %v\n", topic, err)
+	if len(targets) == 0 && report != nil {
+		report(BlockInfo{When: time.Now(), Topic: topic, Event: Event{Topic: topic, OriginalTopic: topic, Args: args}, Reason: "no_listeners"})
 	}
-
-	// If nothing matches, surface a single 'no_listeners' report.
-	if e.OnBlocked != nil {
-		empty := true
-		for _, _topic := range match {
-			if len(e.listeners[_topic]) > 0 {
-				empty = false
-				break
-			}
-		}
-		if empty {
-			fmt.Printf("[emitter] Emit: no listeners for topic=%q\n", topic)
-			// No concrete listeners for this topic / pattern.
-			e.OnBlocked(BlockInfo{
-				When:       time.Now(),
-				Topic:      topic,
-				ListenerID: 0,
-				Cap:        0,
-				Len:        0,
-				Event:      Event{Topic: topic, OriginalTopic: topic},
-				Reason:     "no_listeners",
-			})
-		}
-	}
-
 	var wg sync.WaitGroup
-	var haveToWait bool
-	for _, _topic := range match {
-		listeners := e.listeners[_topic]
-		event := Event{
-			Topic:         _topic,
-			OriginalTopic: topic,
-			Args:          args,
-		}
-
-		applyMiddlewares(&event, e.getMiddlewares(_topic))
-
-		// whole topic is skipping
-		// if (event.Flags | FlagVoid) == event.Flags {
-		// 	continue
-		// }
-
-	Loop:
-		for i := len(listeners) - 1; i >= 0; i-- {
-			lstnr := listeners[i]
-			evn := *(&event) // copy the event
-			applyMiddlewares(&evn, lstnr.middlewares)
-
-			if (evn.Flags | FlagVoid) == evn.Flags {
-				continue Loop
+	haveAsync := false
+	for _, target := range targets {
+		event := Event{Topic: target.topic, OriginalTopic: topic, Args: args}
+		applyMiddlewares(&event, target.middleware)
+		for _, l := range target.listeners {
+			d := delivery{target.topic, l, event}
+			applyMiddlewares(&d.event, d.listener.middlewares)
+			if d.event.Flags&FlagVoid != 0 {
+				continue
 			}
-
-			if (evn.Flags | FlagSync) == evn.Flags {
-				_, remove, _ := e.sendWithReport(done, lstnr, &evn)
+			deliver := func(d delivery) {
+				remove, info := d.listener.deliver(done, d.event)
 				if remove {
-					defer e.Off(event.Topic, lstnr.ch)
+					e.removeListener(d.topic, d.listener.id)
 				}
+				// Callbacks may use registry methods; neither mutex is held here.
+				if info != nil && report != nil {
+					report(*info)
+				}
+			}
+			if d.event.Flags&FlagSync != 0 {
+				deliver(d)
 			} else {
+				haveAsync = true
 				wg.Add(1)
-				haveToWait = true
-				go func(lstnr listener, event *Event) {
-					e.mu.Lock()
-					_, remove, _ := e.sendWithReport(done, lstnr, event)
-					if remove {
-						defer e.Off(event.Topic, lstnr.ch)
-					}
-					wg.Done()
-					e.mu.Unlock()
-				}(lstnr, &evn)
+				go func(d delivery) { defer wg.Done(); deliver(d) }(d)
 			}
 		}
-
 	}
-	if haveToWait {
-		go func(done chan struct{}) {
-			defer func() { recover() }()
-			wg.Wait()
-			close(done)
-		}(done)
-	} else {
+	finish := func() {
+		// The legacy cancellation API also allows callers to close done.
+		defer func() { recover() }()
 		close(done)
 	}
-
-	e.mu.Unlock()
+	if haveAsync {
+		go func() { wg.Wait(); finish() }()
+	} else {
+		finish()
+	}
 	return done
+}
+
+// deliver serializes sends and closure for this listener only. Default blocking
+// delivery remains lossless until canceled by Off or the Emit cancellation channel.
+func (l listener) deliver(done chan struct{}, ev Event) (remove bool, info *BlockInfo) {
+	l.state.mu.Lock()
+	defer l.state.mu.Unlock()
+	if l.state.closed {
+		return false, nil
+	}
+	select {
+	case <-l.state.stopped:
+		return false, nil
+	default:
+	}
+	select {
+	case <-done:
+		return false, nil
+	default:
+	}
+	sent := false
+	if ev.Flags&(FlagSkip|FlagClose) != 0 {
+		select {
+		case <-l.state.stopped:
+			return false, nil
+		case <-done:
+			return false, nil
+		case l.ch <- ev:
+			sent = true
+		default:
+		}
+	} else {
+		select {
+		case <-l.state.stopped:
+			return false, nil
+		case <-done:
+			return false, nil
+		case l.ch <- ev:
+			sent = true
+		}
+	}
+	if !sent {
+		info = &BlockInfo{When: time.Now(), Topic: ev.Topic, ListenerID: l.id, Cap: cap(l.ch), Len: len(l.ch), Event: ev, Reason: "buffer_full"}
+	}
+	remove = sent && ev.Flags&FlagOnce != 0 || !sent && ev.Flags&FlagClose != 0
+	if remove {
+		l.closeLocked()
+	}
+	return
 }
 
 func pushEvent(
@@ -402,30 +460,6 @@ func reasonFromFlags(f Flag) string {
 	}
 }
 
-// sendWithReport wraps pushEvent to invoke OnBlocked when a send could not proceed.
-func (e *Emitter) sendWithReport(done chan struct{}, lstnr listener, ev *Event) (success, remove bool, err error) {
-	success, remove, reason := pushEvent(done, lstnr.ch, ev)
-
-	if !success && e.OnBlocked != nil {
-		ri := reason
-		if ri == "" {
-			ri = "unknown"
-		}
-		bi := BlockInfo{
-			When:       time.Now(),
-			Topic:      ev.Topic,
-			ListenerID: lstnr.id,
-			Cap:        cap(lstnr.ch),
-			Len:        len(lstnr.ch),
-			Event:      *ev,
-			Reason:     ri,
-		}
-		fmt.Printf("[emitter] blocked: topic=%q id=%d usage=%d/%d reason=%s\n", bi.Topic, bi.ListenerID, bi.Len, bi.Cap, ri)
-		e.OnBlocked(bi)
-	}
-	return
-}
-
 func (e *Emitter) getMiddlewares(topic string) []func(*Event) {
 	var acc []func(*Event)
 	for pattern, v := range e.middlewares {
@@ -449,7 +483,6 @@ func (e *Emitter) matched(topic string) ([]string, error) {
 	var err error
 	for k := range e.listeners {
 		if matched, err := path.Match(topic, k); err != nil {
-			fmt.Printf("[emitter] matched: invalid pattern %q vs %q: %v\n", topic, k, err)
 			return []string{}, err
 		} else if matched {
 			acc = append(acc, k)
@@ -562,5 +595,6 @@ func (e *Emitter) StartMetricsLogger(every time.Duration, logf func(string, ...i
 			}
 		}
 	}()
-	return func() { close(stop) }
+	var once sync.Once
+	return func() { once.Do(func() { close(stop) }) }
 }

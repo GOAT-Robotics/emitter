@@ -158,12 +158,18 @@ func TestOrSkipOnce(t *testing.T) {
 	ee := New(0)
 	pipe := ee.On("test", Skip, Once)
 	<-ee.Emit("test")
-	l := ee.Listeners("test")
-	expect(t, len(l), 1)
-	go ee.Emit("test")
+	// An unsuccessful nonblocking send must not consume a Once listener.
+	expect(t, len(ee.Listeners("test")), 1)
+	ee.Off("test", pipe)
+
+	// Buffering makes successful delivery deterministic without relying on the
+	// scheduler to start an unbuffered receiver before a Skip send.
+	pipe = ee.OnWithCap("test", 1, Skip, Once)
+	<-ee.Emit("test") // completion includes registry cleanup
 	<-pipe
-	l = ee.Listeners("test")
-	expect(t, len(l), 0)
+	expect(t, len(ee.Listeners("test")), 0)
+	_, ok := <-pipe
+	expect(t, ok, false)
 }
 
 func TestVoid(t *testing.T) {
